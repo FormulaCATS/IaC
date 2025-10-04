@@ -2,9 +2,9 @@
 # 目标：为指定的域名自动化创建 Nginx 站点、申请 SSL 证书并应用安全配置。
 # 特性：
 # 1) 分阶段彩色输出，过程清晰。
-# 2) 具备幂等性，可重复安全执行。
+# 2) 严格遵循原始脚本的执行逻辑，确保 Certbot 流程正确。
 # 3) 包含最终执行汇总报告。
-# 4) 优化了 Nginx 配置，增强了安全性。
+# 4) 优化了最终的 Nginx 配置，增强了安全性。
 
 set -euo pipefail
 
@@ -114,48 +114,51 @@ chown www-data:www-data "$WEB_ROOT"
 log "目录 '$WEB_ROOT' 创建并设置权限成功。"
 SUCCESS_LOG+=("$CURRENT_STAGE")
 
-# 检查证书是否存在，决定是否需要申请
-if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
-    warn "检测到 '$DOMAIN' 的 SSL 证书已存在，将跳过证书申请步骤。"
-    SUCCESS_LOG+=("为 Certbot 配置临时 Nginx - 已跳过")
-    SUCCESS_LOG+=("申请 SSL 证书 (Certbot) - 已跳过")
-else
-    # 阶段 2: 临时 Nginx 配置
-    log_task "为 Certbot 配置临时 Nginx"
-    log "创建用于 Let's Encrypt 验证的临时 Nginx 配置..."
-    cat > "$NGINX_CONF" <<- EOM
+
+# 阶段 2: 创建并启用用于证书申请的初始 Nginx 配置
+log_task "创建并启用用于证书申请的初始 Nginx 配置"
+log "创建用于 Let's Encrypt 验证的初始 HTTP 配置..."
+cat > "$NGINX_CONF" <<- 'EOM'
 server {
     listen 80;
-    server_name $DOMAIN;
-    root $WEB_ROOT;
+    server_name DOMAIN_PLACEHOLDER;
+    root WEB_ROOT_PLACEHOLDER;
+
     location /.well-known/acme-challenge/ { allow all; }
-    location / { try_files \$uri \$uri/ =404; }
+    location / { try_files $uri $uri/ =404; }
 }
 EOM
-    if [ ! -L "/etc/nginx/sites-enabled/$DOMAIN" ]; then
-        ln -s "$NGINX_CONF" /etc/nginx/sites-enabled/
-    fi
-    log "测试并重载 Nginx 配置..."
-    nginx -t || { error "Nginx 配置测试失败。"; print_summary; exit 1; }
-    systemctl reload nginx || { error "Nginx 重载失败。"; print_summary; exit 1; }
-    log "临时配置已应用。"
-    SUCCESS_LOG+=("$CURRENT_STAGE")
 
-    # 阶段 3: 申请 SSL 证书
-    log_task "申请 SSL 证书 (Certbot)"
-    log "开始使用 certbot 申请证书，请稍候..."
-    certbot certonly --webroot -w "$WEB_ROOT" -d "$DOMAIN" --agree-tos --email root@omnios.world --non-interactive || {
-        error "Certbot 证书申请失败。请检查域名解析和防火墙设置。"
-        print_summary
-        exit 1
-    }
-    log "SSL 证书申请成功！"
-    SUCCESS_LOG+=("$CURRENT_STAGE")
+sed -i "s|DOMAIN_PLACEHOLDER|$DOMAIN|g" "$NGINX_CONF"
+sed -i "s|WEB_ROOT_PLACEHOLDER|$WEB_ROOT|g" "$NGINX_CONF"
+log "占位符替换完成。"
+
+if [ ! -L "/etc/nginx/sites-enabled/$DOMAIN" ]; then
+    ln -s "$NGINX_CONF" "/etc/nginx/sites-enabled/"
+    log "Nginx 配置已启用。"
 fi
 
-# 阶段 4: 最终 Nginx 配置
-log_task "配置最终的 Nginx (HTTP & HTTPS)"
-log "正在生成最终的 Nginx 配置文件..."
+log "测试并重载 Nginx 配置..."
+nginx -t || { error "Nginx 配置测试失败。"; print_summary; exit 1; }
+systemctl reload nginx || { error "Nginx 重载失败。"; print_summary; exit 1; }
+log "初始配置已应用，准备申请证书。"
+SUCCESS_LOG+=("$CURRENT_STAGE")
+
+# 阶段 3: 申请 SSL 证书
+log_task "申请 SSL 证书 (Certbot)"
+log "开始使用 certbot 申请证书，请稍候..."
+certbot certonly --webroot -w "$WEB_ROOT" -d "$DOMAIN" --agree-tos --email root@omnios.world --non-interactive || {
+    error "Certbot 证书申请失败。请检查域名解析和防火墙设置。"
+    print_summary
+    exit 1
+}
+log "SSL 证书申请成功！"
+SUCCESS_LOG+=("$CURRENT_STAGE")
+
+
+# 阶段 4: 创建并应用最终的 Nginx 配置 (HTTPS)
+log_task "创建并应用最终的 Nginx 配置 (HTTPS)"
+log "正在生成最终的 Nginx 配置文件 (覆盖初始配置)..."
 cat > "$NGINX_CONF" <<- EOM
 server {
     listen 80;
@@ -231,3 +234,4 @@ fi
 # 4. 收尾
 #-----------------------------
 print_summary
+
