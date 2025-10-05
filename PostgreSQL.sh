@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Debian 13(trixie) · PGDG + PostgreSQL 17 · 无交互安装与非阻塞状态检测
+# Debian 13 (trixie) · PGDG + PostgreSQL 17 · 无交互安装与非阻塞状态检测（幂等）
 
 set -Eeuo pipefail
 
@@ -17,10 +17,9 @@ ok(){  printf '%s✓ %s%s\n' "${BOLD}" "$*" "${RESET}"; }
 err(){ printf '%s✗ %s%s\n' "${BOLD}" "$*" "${RESET}" >&2; }
 
 # ---------- 提权/APT ----------
-SUDO=$([ "$(id -u)" -eq 0 ] && echo "" || echo "sudo")
+if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 export DEBIAN_FRONTEND=noninteractive
 APT_INSTALL_OPTS=(-y -o Dpkg::Options::=--force-confnew -o Dpkg::Use-Pty=0)
-
 trap 'err "命令失败 · 行号: $LINENO"; exit 1' ERR
 
 # ---------- 环境检测 ----------
@@ -38,7 +37,8 @@ ${SUDO} apt-get install "${APT_INSTALL_OPTS[@]}" --no-install-recommends ca-cert
 
 ${SUDO} install -d -m 0755 /etc/apt/keyrings
 if [ ! -s /etc/apt/keyrings/postgresql.gpg ]; then
-  curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | ${SUDO} gpg --dearmor -o /etc/apt/keyrings/postgresql.gpg
+  curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    | ${SUDO} gpg --dearmor -o /etc/apt/keyrings/postgresql.gpg
   ok "导入 PGDG 签名密钥"
 else
   ok "PGDG 签名密钥已存在，跳过导入"
@@ -64,14 +64,30 @@ ${SUDO} systemctl enable --now postgresql >/dev/null 2>&1 || true
 STATE="$(${SUDO} systemctl is-active postgresql 2>/dev/null || true)"
 out "postgresql 服务状态: ${STATE:-unknown}"
 
-# ---------- 探测工具与端口 ----------
+# ---------- 以 postgres 身份执行 的统一封装 ----------
+# 在 root 下优先使用 runuser；非 root 使用 sudo。均注入最小 PATH 和干净环境。
+MIN_PATH="/usr/lib/postgresql/17/bin:/usr/bin:/bin"
+if [ "$(id -u)" -eq 0 ]; then
+  PG_EXEC=(runuser -u postgres --)
+else
+  PG_EXEC=(sudo -u postgres)
+fi
+pgexec() { "${PG_EXEC[@]}" env -i PATH="${MIN_PATH}" PSQL_PAGER= "$@"; }
+pgexec_to() { # pgexec 带超时（秒）
+  local sec="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${sec}s" "${PG_EXEC[@]}" env -i PATH="${MIN_PATH}" PSQL_PAGER= "$@"
+  else
+    "${PG_EXEC[@]}" env -i PATH="${MIN_PATH}" PSQL_PAGER= "$@"
+  fi
+}
+
+# ---------- 探测端口 ----------
 PGPORT="$(
   command -v pg_lsclusters >/dev/null 2>&1 \
     && pg_lsclusters --no-header 2>/dev/null | awk '$4=="online"{print $3; exit}' \
     || echo 5432
 )"
-# 为最小环境设定 PATH，确保找到 pg_isready/psql
-MIN_PATH="/usr/lib/postgresql/17/bin:/usr/bin:/bin"
 
 # ---------- 基本验证（非阻塞） ----------
 sec "基本验证"
@@ -81,20 +97,16 @@ else
   err "未找到 psql 可执行文件"
 fi
 
-# 1) 就绪检查：优先 UNIX socket；若失败，再回退 TCP 127.0.0.1（同样 2 秒超时）
-READY_OUT="$(${SUDO} -u postgres env -i PATH=${MIN_PATH} \
-  pg_isready -h /var/run/postgresql -p "${PGPORT}" -t 2 2>&1 || true)"
+# 1) 就绪检查：先 UNIX socket，失败回退 127.0.0.1；每步 2 秒超时
+READY_OUT="$(pgexec_to 2 pg_isready -h /var/run/postgresql -p "${PGPORT}" -t 2 2>&1 || true)"
 if ! printf '%s' "${READY_OUT}" | grep -qi 'accepting connections'; then
-  READY_OUT_FALLBACK="$(${SUDO} -u postgres env -i PATH=${MIN_PATH} \
-    pg_isready -h 127.0.0.1 -p "${PGPORT}" -t 2 2>&1 || true)"
-  [ -n "${READY_OUT_FALLBACK}" ] && READY_OUT="${READY_OUT}${READY_OUT:+ ; }${READY_OUT_FALLBACK}"
+  READY_FB="$(pgexec_to 2 pg_isready -h 127.0.0.1 -p "${PGPORT}" -t 2 2>&1 || true)"
+  [ -n "${READY_FB}" ] && READY_OUT="${READY_OUT}${READY_OUT:+ ; }${READY_FB}"
 fi
 [ -n "${READY_OUT}" ] && out "pg_isready: ${READY_OUT}" || err "pg_isready 未产生输出"
 
-# 2) SQL 版本：2 秒超时，固定 UNIX socket + peer 认证
-TO="$(command -v timeout >/dev/null 2>&1 && echo 'timeout 2s' || true)"
-SQL_VER="$(${SUDO} -u postgres env -i PATH=${MIN_PATH} PSQL_PAGER= \
-  ${TO} psql -h /var/run/postgresql -p "${PGPORT}" -d postgres -Atqc 'SELECT version();' 2>/dev/null || true)"
+# 2) SQL 版本：以 postgres 身份，通过 UNIX socket，2 秒超时
+SQL_VER="$(pgexec_to 2 psql -h /var/run/postgresql -p "${PGPORT}" -d postgres -Atqc 'SELECT version();' 2>/dev/null || true)"
 if [ -n "${SQL_VER}" ]; then
   out "数据库内核: ${SQL_VER}"
 else
