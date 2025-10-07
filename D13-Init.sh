@@ -145,9 +145,9 @@ retry 3 5 apt-get install -y --no-install-recommends \
   vim nano gcc rsync p7zip-full unzip curl wget sshpass nload net-tools tree iftop sudo nmap make git apache2-utils expect yq dnsutils \
   apt-transport-https lsb-release ca-certificates gnupg
 retry 3 5 apt-get install -y python3-pip python3-setuptools
-python3 -m pip install --break-system-packages -q \
-  python-docx openpyxl python-pptx PyMuPDF xlrd pyth
-python3 -m pip install --break-system-packages -q openai
+#python3 -m pip install --break-system-packages -q \
+#  python-docx openpyxl python-pptx PyMuPDF xlrd pyth
+#python3 -m pip install --break-system-packages -q openai
 log "基础工具安装完成。"
 SUCCESS_LOG+=("$CURRENT_STAGE")
 
